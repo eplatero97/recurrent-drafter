@@ -1,0 +1,47 @@
+# Speculators Framework with Recurrent Drafting
+# This is the core dependency that contains the recurrent drafting implementation
+git+https://github.com/eplatero97/speculators.git
+
+# Core ML Dependencies
+torch>=2.0.0
+transformers>=4.30.0
+datasets>=2.10.0
+numpy>=1.21.0
+pydantic>=2.0.0
+
+# Training and Optimization
+accelerate>=0.20.0
+scipy>=1.9.0
+
+# Data Processing and Utilities
+tqdm>=4.64.0
+tokenizers>=0.13.0
+
+# Optional: Experiment Tracking
+# Uncomment if you want to use Weights & Biases
+# wandb>=0.15.0
+
+# Optional: vLLM Integration
+# Uncomment if you want vLLM deployment support
+# vllm>=0.2.0
+
+# Optional: Development and Testing
+# Uncomment for development
+# pytest>=7.0.0
+# pytest-cov>=4.0.0
+# black>=22.0.0
+# isort>=5.10.0
+# flake8>=5.0.0
+# mypy>=1.0.0
+
+# Optional: Jupyter Notebooks
+# Uncomment if you want notebook support
+# jupyter>=1.0.0
+# ipywidgets>=8.0.0
+# matplotlib>=3.5.0
+# seaborn>=0.11.0
+
+# Optional: Additional Model Support
+# Uncomment for specific model architectures
+# sentencepiece>=0.1.97  # For T5, ALBERT, etc.
+# protobuf>=3.20.0       # For some model formats
