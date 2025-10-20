@@ -23,7 +23,6 @@ import transformers
 from transformers import Trainer, AutoModelForCausalLM, AutoTokenizer, AutoConfig
 from torch.utils.data import DataLoader
 import sys
-sys.path.insert(0, 'speculators/src')
 
 from speculators.models.recurrent_drafting import RecurrentDraftingConfig, RecurrentDraftingSpeculator
 

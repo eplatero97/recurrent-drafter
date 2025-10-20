@@ -42,7 +42,6 @@ import torch
 import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import sys
-sys.path.insert(0, 'speculators/src')
 
 from speculators.models.recurrent_drafting import RecurrentDraftingConfig, RecurrentDraftingSpeculator
 

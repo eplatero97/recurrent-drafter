@@ -10,8 +10,8 @@
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/recurrent-drafting-trainer
-cd recurrent-drafting-trainer
+git clone https://github.com/eplatero97/recurrent-drafter
+cd recurrent-drafter
 
 # Install dependencies
 pip install -r requirements.txt
@@ -87,8 +87,8 @@ pip install vllm
 ### Development Installation
 
 ```bash
-git clone https://github.com/yourusername/recurrent-drafting-trainer
-cd recurrent-drafting-trainer
+git clone https://github.com/yourusername/recurrent-drafter
+cd recurrent-drafter
 pip install -e .
 ```
 
@@ -448,8 +448,8 @@ We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) f
 ### Development Setup
 
 ```bash
-git clone https://github.com/yourusername/recurrent-drafting-trainer
-cd recurrent-drafting-trainer
+git clone https://github.com/yourusername/recurrent-drafter
+cd recurrent-drafter
 pip install -e ".[dev]"
 pre-commit install
 ```
@@ -492,8 +492,8 @@ See [NOTICE](NOTICE) file for complete attribution details.
 
 ## 📞 Support
 
-- **Issues**: [GitHub Issues](https://github.com/yourusername/recurrent-drafting-trainer/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/yourusername/recurrent-drafting-trainer/discussions)
+- **Issues**: [GitHub Issues](https://github.com/yourusername/recurrent-drafter/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/yourusername/recurrent-drafter/discussions)
 - **Email**: your.email@example.com
 
 ## 🌟 Citation
@@ -501,11 +501,11 @@ See [NOTICE](NOTICE) file for complete attribution details.
 If you use this implementation in your research, please cite both the original Apple work and this repository:
 
 ```bibtex
-@misc{recurrent-drafting-trainer,
+@misc{recurrent-drafter,
   title={Recurrent Drafting Trainer: Production-Ready Implementation},
-  author={Your Name},
+  author={Erick Platero},
   year={2024},
-  url={https://github.com/yourusername/recurrent-drafting-trainer}
+  url={https://github.com/yourusername/recurrent-drafter}
 }
 
 @article{apple-recurrent-drafting,
@@ -517,5 +517,3 @@ If you use this implementation in your research, please cite both the original A
 ```
 
 ---
-
-**Made with ❤️ for the ML community**
