@@ -75,19 +75,16 @@ Recurrent Drafting is a speculative decoding technique that accelerates large la
 
 ```bash
 # Basic installation
-pip install torch transformers datasets pydantic numpy tqdm
+pip install -r requirements.txt
 
 # Optional: For experiment tracking
 pip install wandb
-
-# Optional: For vLLM deployment
-pip install vllm
 ```
 
 ### Development Installation
 
 ```bash
-git clone https://github.com/yourusername/recurrent-drafter
+git clone https://github.com/eplatero97/recurrent-drafter
 cd recurrent-drafter
 pip install -e .
 ```
