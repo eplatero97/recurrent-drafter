@@ -34,6 +34,7 @@ except ImportError:
     WANDB_AVAILABLE = False
     wandb = None
 
+IGNORE_TOKEN_ID = -100
 
 class RecurrentDraftingTrainer(Trainer):
     """Custom trainer for recurrent drafting speculator based on Apple's implementation."""
@@ -41,6 +42,7 @@ class RecurrentDraftingTrainer(Trainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.wandb_enabled = getattr(self.args, 'use_wandb', False) and WANDB_AVAILABLE
+        self.loss_fct = nn.CrossEntropyLoss(ignore_index=IGNORE_TOKEN_ID)
         
     def compute_loss(self, model, inputs, return_outputs=False):
         """
@@ -114,14 +116,12 @@ class RecurrentDraftingTrainer(Trainer):
         # Shift labels for next token prediction
         shifted_labels = labels[:, 1:].contiguous()  # [batch_size, seq_len-1]
         
-        # Compute cross-entropy loss
-        loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
-        
         # Flatten for loss computation
         flat_logits = logits[:, :-1].contiguous().view(-1, vocab_size)  # [batch_size*(seq_len-1), vocab_size]
         flat_labels = shifted_labels.view(-1)  # [batch_size*(seq_len-1)]
         
-        loss = loss_fct(flat_logits, flat_labels)
+        # Use pre-initialized loss function
+        loss = self.loss_fct(flat_logits, flat_labels)
         
         # Compute top-k accuracy for logging
         with torch.no_grad():
@@ -317,7 +317,7 @@ class DataCollatorForLanguageModeling:
             attention_masks, batch_first=True, padding_value=0
         )
         labels = torch.nn.utils.rnn.pad_sequence(
-            labels, batch_first=True, padding_value=-100
+            labels, batch_first=True, padding_value=IGNORE_TOKEN_ID
         )
         
         return {
