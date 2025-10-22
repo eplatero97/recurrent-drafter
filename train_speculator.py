@@ -26,7 +26,7 @@ import sys
 
 from speculators.models.recurrent_drafting import RecurrentDraftingConfig, RecurrentDraftingSpeculator
 
-# Optional wandb import
+# Optional wandb import for custom logging
 try:
     import wandb
     WANDB_AVAILABLE = True
@@ -41,7 +41,6 @@ class RecurrentDraftingTrainer(Trainer):
     
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.wandb_enabled = getattr(self.args, 'use_wandb', False) and WANDB_AVAILABLE
         self.loss_fct = nn.CrossEntropyLoss(ignore_index=IGNORE_TOKEN_ID)
         
     def compute_loss(self, model, inputs, return_outputs=False):
@@ -78,25 +77,15 @@ class RecurrentDraftingTrainer(Trainer):
             self.args.drafter_top_k
         )
         
-        # Enhanced logging for wandb
-        if self.wandb_enabled and self.state.global_step % self.args.logging_steps == 0:
-            enhanced_log_dict = {
-                **log_dict,
-                "learning_rate": self.get_lr(),
-                "epoch": self.state.epoch,
-                "global_step": self.state.global_step,
-            }
-            
-            # Add model-specific metrics
-            if hasattr(model, 'config'):
-                enhanced_log_dict.update({
-                    "model/num_draft_layers": model.config.num_draft_layers,
-                    "model/exit_dim": model.config.exit_dim,
-                    "model/rnn_enabled": model.config.rnn,
-                })
-            
-            wandb.log(enhanced_log_dict, step=self.state.global_step)
+        # Add custom model-specific metrics for logging
+        if hasattr(model, 'config'):
+            log_dict.update({
+                "model/num_draft_layers": model.config.num_draft_layers,
+                "model/exit_dim": model.config.exit_dim,
+                "model/rnn_enabled": model.config.rnn,
+            })
         
+        # Log metrics (HF Trainer will handle wandb automatically if report_to='wandb')
         self.log(log_dict)
         return (loss, eval_log) if return_outputs else loss
     
@@ -125,16 +114,16 @@ class RecurrentDraftingTrainer(Trainer):
         
         # Compute top-k accuracy for logging
         with torch.no_grad():
-            _, top_k_preds = torch.topk(flat_logits, top_k, dim=-1)
-            correct = (top_k_preds == flat_labels.unsqueeze(-1)).any(dim=-1)
-            accuracy = correct.float().mean()
+            top_k_preds = torch.topk(flat_logits, top_k, dim=-1)[1] # [batch_size*(seq_len-1), topk]
+            correct = (top_k_preds == flat_labels.unsqueeze(-1)).any(dim=-1) # [batch_size*(seq_len-1)]
+            accuracy = correct.float().mean().item()
         
         log_dict = {
             "train_loss": loss.item(),
-            f"train_top{top_k}_accuracy": accuracy.item()
+            f"train_top{top_k}_accuracy": accuracy
         }
         
-        eval_log = [accuracy.item()]  # For metrics computation
+        eval_log = [accuracy]  # For metrics computation
         
         return loss, log_dict, eval_log
 
@@ -185,67 +174,50 @@ class TrainingArguments(transformers.TrainingArguments):
         default=1.0,
         metadata={"help": "Multiplier for exit dimension (exit_dim = multiplier * hidden_size)"},
     )
-    use_wandb: bool = field(
-        default=False,
-        metadata={"help": "Enable Weights & Biases logging"},
-    )
-    wandb_project: str = field(
-        default="recurrent-drafting",
-        metadata={"help": "Weights & Biases project name"},
-    )
-    wandb_run_name: Optional[str] = field(
+    # Wandb integration via HF Trainer's built-in support
+    run_name: Optional[str] = field(
         default=None,
-        metadata={"help": "Weights & Biases run name (auto-generated if None)"},
+        metadata={"help": "Run name for experiment tracking (auto-generated if None)"},
     )
 
 
-def setup_wandb(model_args, training_args, model_config=None):
-    """Setup Weights & Biases logging if enabled."""
-    
-    if not training_args.use_wandb:
-        return
-    
-    if not WANDB_AVAILABLE:
-        print("⚠️ wandb not available. Install with: pip install wandb")
-        training_args.use_wandb = False
-        return
+def setup_wandb_config(model_args, training_args, drafter_config=None):
+    """Setup wandb config for HF Trainer integration."""
     
     # Generate run name if not provided
-    run_name = training_args.wandb_run_name
-    if run_name is None:
+    if training_args.run_name is None:
         base_model = model_args.llm_name_or_path.split('/')[-1]
         run_name = f"{base_model}_n{training_args.drafter_predict_n_tokens}_layers{training_args.drafter_num_layers}"
         if training_args.rnn:
             run_name += "_rnn"
+        training_args.run_name = run_name
     
-    # Initialize wandb
-    wandb.init(
-        project=training_args.wandb_project,
-        name=run_name,
-        config={
-            # Model configuration
-            "base_model": model_args.llm_name_or_path,
-            "drafter_predict_n_tokens": training_args.drafter_predict_n_tokens,
-            "drafter_num_layers": training_args.drafter_num_layers,
-            "drafter_top_k": training_args.drafter_top_k,
-            "rnn_enabled": training_args.rnn,
-            "exit_dim_multiplier": training_args.exit_dim_multiplier,
-            
-            # Training configuration
-            "learning_rate": training_args.learning_rate,
-            "batch_size": training_args.per_device_train_batch_size,
-            "gradient_accumulation_steps": training_args.gradient_accumulation_steps,
-            "num_train_epochs": training_args.num_train_epochs,
-            "warmup_steps": training_args.warmup_steps,
-            "model_max_length": training_args.model_max_length,
-            
-            # Model architecture details
-            **({"model_config": model_config} if model_config else {}),
-        },
-        tags=["recurrent-drafting", "speculative-decoding", "apple-method"],
-    )
+    # Set wandb tags via environment variable (HF Trainer will pick this up)
+    import os
+    os.environ["WANDB_TAGS"] = "recurrent-drafting,speculative-decoding,apple-method"
     
-    print(f"📊 Weights & Biases initialized: {wandb.run.url}")
+    # Custom config that will be logged to wandb
+    custom_config = {
+        # Model configuration
+        "base_model": model_args.llm_name_or_path,
+        "drafter_predict_n_tokens": training_args.drafter_predict_n_tokens,
+        "drafter_num_layers": training_args.drafter_num_layers,
+        "drafter_top_k": training_args.drafter_top_k,
+        "rnn_enabled": training_args.rnn,
+        "exit_dim_multiplier": training_args.exit_dim_multiplier,
+        "model_max_length": training_args.model_max_length,
+    }
+    
+    # Add drafter config details if available
+    if drafter_config:
+        custom_config.update({
+            "drafter_vocab_size": drafter_config.vocab_size,
+            "drafter_hidden_size": drafter_config.hidden_size,
+            "drafter_exit_dim": drafter_config.exit_dim,
+            "drafter_emb_norm": drafter_config.emb_norm,
+        })
+    
+    return custom_config
 
 
 def get_tokenizer(model_args, training_args):
@@ -492,8 +464,8 @@ def train(model_args, training_args):
     # Generate drafter config from base model
     drafter_config = generate_drafter_config_from_base(llm, training_args)
     
-    # Setup wandb before creating model
-    setup_wandb(model_args, training_args, drafter_config.to_dict())
+    # Setup wandb config for HF Trainer integration
+    wandb_config = setup_wandb_config(model_args, training_args, drafter_config)
     
     # Create speculator and attach verifier
     speculator = RecurrentDraftingSpeculator(drafter_config, verifier=None)
@@ -516,6 +488,20 @@ def train(model_args, training_args):
         tokenizer=tokenizer,
         mlm=False
     )
+    
+    # Log custom config to wandb if enabled
+    if "wandb" in training_args.report_to:
+        if WANDB_AVAILABLE and wandb.run is None:
+            # Initialize wandb with custom config if not already done by HF Trainer
+            import os
+            wandb.init(
+                project=os.environ.get("WANDB_PROJECT", "recurrent-drafting"),
+                name=training_args.run_name,
+                config=wandb_config,
+            )
+        elif WANDB_AVAILABLE and wandb.run:
+            # Update existing wandb run with custom config
+            wandb.config.update(wandb_config)
     
     # Create trainer
     trainer = RecurrentDraftingTrainer(
@@ -541,27 +527,29 @@ def train(model_args, training_args):
     
     print("✅ Training completed!")
     
-    # Log final metrics to wandb
-    if training_args.use_wandb and WANDB_AVAILABLE:
+    # Log final metrics and artifacts to wandb if enabled
+    if "wandb" in training_args.report_to and WANDB_AVAILABLE and wandb.run:
         # Log model artifacts
-        model_artifact = wandb.Artifact(
-            name=f"recurrent-drafter-{wandb.run.id}",
-            type="model",
-            description=f"Trained recurrent drafting speculator for {model_args.llm_name_or_path}"
-        )
-        model_artifact.add_dir(training_args.output_dir)
-        wandb.log_artifact(model_artifact)
-        
-        # Log training summary
-        wandb.summary.update({
-            "final_model_path": training_args.output_dir,
-            "training_completed": True,
-            "total_parameters": sum(p.numel() for p in speculator.parameters()),
-            "trainable_parameters": sum(p.numel() for p in speculator.parameters() if p.requires_grad),
-        })
-        
-        wandb.finish()
-        print(f"📊 Training artifacts logged to: {wandb.run.url}")
+        try:
+            model_artifact = wandb.Artifact(
+                name=f"recurrent-drafter-{wandb.run.id}",
+                type="model",
+                description=f"Trained recurrent drafting speculator for {model_args.llm_name_or_path}"
+            )
+            model_artifact.add_dir(training_args.output_dir)
+            wandb.log_artifact(model_artifact)
+            
+            # Log training summary
+            wandb.summary.update({
+                "final_model_path": training_args.output_dir,
+                "training_completed": True,
+                "total_parameters": sum(p.numel() for p in speculator.parameters()),
+                "trainable_parameters": sum(p.numel() for p in speculator.parameters() if p.requires_grad),
+            })
+            
+            print(f"📊 Training artifacts logged to: {wandb.run.url}")
+        except Exception as e:
+            print(f"⚠️ Could not log artifacts to wandb: {e}")
     
     return speculator
 
@@ -674,12 +662,13 @@ def eval_model(model_args, training_args):
             print("   ❌ Poor. More training needed")
             performance_level = "poor"
         
-        # Log evaluation results to wandb
-        if training_args.use_wandb and WANDB_AVAILABLE:
+        # Log evaluation results to wandb if enabled
+        if "wandb" in training_args.report_to and WANDB_AVAILABLE:
             # Initialize wandb for evaluation if not already done
             if not wandb.run:
+                import os
                 wandb.init(
-                    project=training_args.wandb_project,
+                    project=os.environ.get("WANDB_PROJECT", "recurrent-drafting"),
                     name=f"eval_{model_args.drafter_name_or_path.split('/')[-1]}",
                     job_type="evaluation",
                     tags=["evaluation", "recurrent-drafting"]
@@ -694,7 +683,6 @@ def eval_model(model_args, training_args):
             })
             
             wandb.log(eval_metrics)
-            wandb.finish()
             print(f"📊 Evaluation results logged to: {wandb.run.url}")
     
     return results
@@ -729,9 +717,8 @@ def create_simple_trainer():
         drafter_num_layers=2,
         rnn=True,
         phase="train",
-        use_wandb=False,  # Disabled by default for quick training
-        wandb_project="recurrent-drafting",
-        wandb_run_name="quick-training"
+        report_to=[],  # No logging for quick training
+        run_name="quick-training"
     )
     
     return model_args, training_args
@@ -788,11 +775,10 @@ def show_training_examples():
     print("  --rnn")
     
     print("\n3. Training with Weights & Biases:")
-    print("python train_speculator.py \\")
+    print("WANDB_PROJECT=my-recurrent-drafting python train_speculator.py \\")
     print("  --llm_name_or_path gpt2 \\")
-    print("  --use_wandb \\")
-    print("  --wandb_project my-recurrent-drafting \\")
-    print("  --wandb_run_name gpt2-experiment-1 \\")
+    print("  --report_to wandb \\")
+    print("  --run_name gpt2-experiment-1 \\")
     print("  --num_train_epochs 3")
     
     print("\n4. Evaluation:")
@@ -800,7 +786,7 @@ def show_training_examples():
     print("  --phase eval \\")
     print("  --llm_name_or_path gpt2 \\")
     print("  --drafter_name_or_path ./models/gpt2-recurrent-drafter \\")
-    print("  --use_wandb  # Optional: log eval results")
+    print("  --report_to wandb  # Optional: log eval results")
 
 
 def main():
@@ -825,10 +811,10 @@ def main():
     parser.add_argument("--phase", type=str, default="train", choices=["train", "eval"])
     parser.add_argument("--model_max_length", type=int, default=512)
     
-    # Weights & Biases arguments
-    parser.add_argument("--use_wandb", action="store_true", help="Enable Weights & Biases logging")
-    parser.add_argument("--wandb_project", type=str, default="recurrent-drafting", help="W&B project name")
-    parser.add_argument("--wandb_run_name", type=str, default=None, help="W&B run name")
+    # Experiment tracking arguments (using HF Trainer's built-in integration)
+    parser.add_argument("--report_to", type=str, nargs="+", default=[], 
+                       help="Experiment tracking services (e.g., 'wandb', 'tensorboard')")
+    parser.add_argument("--run_name", type=str, default=None, help="Run name for experiment tracking")
     
     args = parser.parse_args()
     
@@ -879,9 +865,8 @@ def main():
             drafter_num_layers=args.drafter_num_layers,
             rnn=args.rnn,
             phase=args.phase,
-            use_wandb=args.use_wandb,
-            wandb_project=args.wandb_project,
-            wandb_run_name=args.wandb_run_name,
+            report_to=args.report_to,  # HF Trainer's built-in experiment tracking
+            run_name=args.run_name,
         )
         
         if args.phase == "train":

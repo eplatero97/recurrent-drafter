@@ -116,21 +116,27 @@ python train_speculator.py \
 ### Training with Experiment Tracking
 
 ```bash
-# Track experiments with Weights & Biases
-python train_speculator.py \
-    --use_wandb \
-    --wandb_project "my-recurrent-drafting" \
-    --wandb_run_name "gpt2-experiment-v1" \
+# Track experiments with Weights & Biases (using HF Trainer integration)
+WANDB_PROJECT="my-recurrent-drafting" python train_speculator.py \
+    --report_to wandb \
+    --run_name "gpt2-experiment-v1" \
     --llm_name_or_path gpt2 \
     --num_train_epochs 5 \
     --per_device_train_batch_size 16
+
+# Alternative: Multiple tracking services
+python train_speculator.py \
+    --report_to wandb tensorboard \
+    --run_name "multi-tracking-experiment" \
+    --llm_name_or_path gpt2 \
+    --num_train_epochs 3
 ```
 
 ### Advanced Training Options
 
 ```bash
-# Large model training with custom configuration
-python train_speculator.py \
+# Large model training with custom configuration and tracking
+WANDB_PROJECT="dialogpt-experiments" python train_speculator.py \
     --llm_name_or_path microsoft/DialoGPT-medium \
     --output_dir ./models/dialogpt-recurrent-drafter \
     --num_train_epochs 3 \
@@ -141,7 +147,8 @@ python train_speculator.py \
     --drafter_num_layers 3 \
     --model_max_length 1024 \
     --rnn \
-    --use_wandb
+    --report_to wandb \
+    --run_name "dialogpt-v2-6tokens"
 ```
 
 ### Training Parameters
@@ -154,6 +161,16 @@ python train_speculator.py \
 | `--beam_length` | Beam sequence length | 4 | 4-6 |
 | `--rnn` | Enable RNN state updates | True | True |
 | `--learning_rate` | Training learning rate | 5e-4 | 3e-4 to 1e-3 |
+
+### Experiment Tracking Parameters
+
+| Parameter | Description | Example | Notes |
+|-----------|-------------|---------|-------|
+| `--report_to` | Tracking services | `wandb tensorboard` | Space-separated list |
+| `--run_name` | Experiment name | `"gpt2-experiment-v1"` | Auto-generated if not provided |
+| `WANDB_PROJECT` | Project name (env) | `"my-experiments"` | Environment variable |
+| `WANDB_ENTITY` | Team/user (env) | `"research-team"` | Environment variable |
+| `WANDB_TAGS` | Experiment tags (env) | `"gpt2,production"` | Comma-separated |
 
 ## 🎮 Generation & Evaluation
 
@@ -258,6 +275,89 @@ python generate_speculator.py \
    Speedup: 1.9x
 ```
 
+## 📊 Experiment Tracking
+
+### Weights & Biases Integration
+
+This implementation uses HuggingFace Trainer's built-in wandb integration for seamless experiment tracking:
+
+```bash
+# Basic wandb tracking
+WANDB_PROJECT="my-experiments" python train_speculator.py \
+    --report_to wandb \
+    --run_name "experiment-1" \
+    --llm_name_or_path gpt2
+
+# Multiple tracking services
+python train_speculator.py \
+    --report_to wandb tensorboard \
+    --run_name "multi-service-tracking"
+
+# Environment-based configuration
+export WANDB_PROJECT="recurrent-drafting-research"
+export WANDB_ENTITY="my-team"
+python train_speculator.py --report_to wandb --run_name "team-experiment"
+```
+
+### What Gets Tracked Automatically
+
+✅ **Standard Metrics** (via HF Trainer):
+- Training/validation loss curves
+- Learning rate schedules
+- System metrics (GPU usage, memory)
+- All hyperparameters from TrainingArguments
+- Model gradients (if enabled)
+
+✅ **Custom Metrics** (drafter-specific):
+- Top-k accuracy for draft predictions
+- Model architecture details (layers, dimensions)
+- Drafter configuration parameters
+- Training artifacts and model checkpoints
+
+### Benefits of HF Integration
+
+🎯 **Simplified Setup**: No manual wandb initialization required
+🔄 **Automatic Logging**: All standard metrics logged without custom code
+🛠️ **Multiple Services**: Support for wandb, tensorboard, and more
+📊 **Consistent Format**: Standard HF logging format across all experiments
+🔧 **Environment Control**: Easy configuration via environment variables
+
+### Advanced Tracking Configuration
+
+```bash
+# Custom wandb settings via environment
+export WANDB_PROJECT="advanced-experiments"
+export WANDB_ENTITY="research-team"
+export WANDB_TAGS="recurrent-drafting,gpt2,production"
+export WANDB_NOTES="Experiment with 6-token prediction"
+
+python train_speculator.py \
+    --report_to wandb \
+    --run_name "6token-experiment" \
+    --drafter_predict_n_tokens 6
+```
+
+### Evaluation Tracking
+
+```bash
+# Track evaluation results
+WANDB_PROJECT="model-evaluation" python train_speculator.py \
+    --phase eval \
+    --llm_name_or_path gpt2 \
+    --drafter_name_or_path ./models/gpt2-recurrent-drafter \
+    --report_to wandb \
+    --run_name "final-evaluation"
+```
+
+### Comparing Experiments
+
+The wandb dashboard automatically provides:
+- 📈 **Loss curves comparison** across runs
+- 📊 **Hyperparameter analysis** and optimization
+- 🎯 **Performance metrics** (acceptance rates, speedup)
+- 💾 **Model artifacts** and checkpoints
+- 📝 **Experiment notes** and reproducibility info
+
 ## 🔧 Configuration
 
 ### Model Configuration
@@ -296,12 +396,13 @@ training_args = TrainingArguments(
 ### Model Evaluation
 
 ```bash
-# Evaluate trained model
-python train_speculator.py \
+# Evaluate trained model with experiment tracking
+WANDB_PROJECT="model-evaluation" python train_speculator.py \
     --phase eval \
     --llm_name_or_path gpt2 \
     --drafter_name_or_path ./models/gpt2-recurrent-drafter \
-    --use_wandb
+    --report_to wandb \
+    --run_name "gpt2-eval-final"
 ```
 
 ### Unit Tests
@@ -368,13 +469,13 @@ python train_speculator.py \
     --per_device_train_batch_size 4
 
 # 3. Medium model with tracking
-python train_speculator.py \
+WANDB_PROJECT="gpt2-medium-experiments" python train_speculator.py \
     --llm_name_or_path gpt2-medium \
     --num_train_epochs 3 \
     --per_device_train_batch_size 2 \
     --gradient_accumulation_steps 4 \
-    --use_wandb \
-    --wandb_project "gpt2-medium-experiments"
+    --report_to wandb \
+    --run_name "medium-model-v1"
 
 # 4. Large model training
 python train_speculator.py \
@@ -419,21 +520,21 @@ python generate_speculator.py \
     --output_file benchmark_results.json
 
 # 4. Performance comparison
-python generate_speculator.py \
+WANDB_PROJECT="performance-comparison" python generate_speculator.py \
     --base_model gpt2 \
     --speculator_path ./models/gpt2-recurrent-drafter \
     --eval_mt_bench \
     --max_num_prompts 100 \
-    --use_wandb \
-    --wandb_project "performance-comparison"
+    --report_to wandb \
+    --run_name "speculative-generation"
 
-python generate_speculator.py \
+WANDB_PROJECT="performance-comparison" python generate_speculator.py \
     --base_model gpt2 \
     --eval_mt_bench \
     --autoregressive \
     --max_num_prompts 100 \
-    --use_wandb \
-    --wandb_project "performance-comparison"
+    --report_to wandb \
+    --run_name "autoregressive-baseline"
 ```
 
 </details>
