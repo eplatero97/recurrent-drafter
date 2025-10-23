@@ -47,12 +47,11 @@ class RecurrentDraftingTrainer(Trainer):
         """
         Compute the training loss for the recurrent drafting model.
         
-        This implements the drafter loss function from the original Apple implementation,
-        adapted for the speculators framework.
+        Supports both ground-truth training and knowledge distillation based on training_args.
         """
         next_n = self.args.drafter_predict_n_tokens
         
-        # Get hidden states from the base model (frozen)
+        # Get hidden states and target logits from the base model (frozen)
         with torch.no_grad():
             base_outputs = model.verifier(
                 input_ids=inputs["input_ids"], 
@@ -60,7 +59,7 @@ class RecurrentDraftingTrainer(Trainer):
                 output_hidden_states=True
             )
             hidden_states = base_outputs.hidden_states[-1]  # Last layer
-            target_logits = base_outputs.logits
+            target_logits = base_outputs.logits  # For knowledge distillation
         
         # Forward pass through speculator
         speculator_outputs = model(
@@ -69,13 +68,26 @@ class RecurrentDraftingTrainer(Trainer):
             attention_mask=inputs["attention_mask"][:, :-next_n] if inputs.get("attention_mask") is not None else None
         )
         
-        # Compute drafter loss (multi-token prediction)
-        loss, log_dict, eval_log = self.drafter_loss(
-            speculator_outputs.logits if hasattr(speculator_outputs, 'logits') else speculator_outputs,
-            inputs["labels"],
-            next_n,
-            self.args.drafter_top_k
-        )
+        # Choose loss computation method
+        if getattr(self.args, 'use_knowledge_distillation', False):
+            # Knowledge distillation: match target distribution from base model
+            loss, log_dict, eval_log = self.knowledge_distillation_loss(
+                speculator_outputs.logits if hasattr(speculator_outputs, 'logits') else speculator_outputs,
+                target_logits,
+                inputs["labels"],
+                next_n,
+                self.args.drafter_top_k,
+                getattr(self.args, 'kd_temperature', 4.0),
+                getattr(self.args, 'kd_alpha', 0.7)
+            )
+        else:
+            # Ground-truth training: direct supervision
+            loss, log_dict, eval_log = self.drafter_loss(
+                speculator_outputs.logits if hasattr(speculator_outputs, 'logits') else speculator_outputs,
+                inputs["labels"],
+                next_n,
+                self.args.drafter_top_k
+            )
         
         # Add custom model-specific metrics for logging
         if hasattr(model, 'config'):
@@ -91,7 +103,7 @@ class RecurrentDraftingTrainer(Trainer):
     
     def drafter_loss(self, logits, labels, next_n, top_k):
         """
-        Compute drafter loss for multi-token prediction.
+        Compute drafter loss for multi-token prediction using ground-truth tokens.
         
         Args:
             logits: Speculator predictions [batch_size, seq_len, vocab_size]
@@ -101,6 +113,14 @@ class RecurrentDraftingTrainer(Trainer):
         """
         batch_size, seq_len, vocab_size = logits.shape
         device = logits.device
+        
+        # Filter to only compute loss on assistant responses if specified
+        if getattr(self.args, 'train_on_assistant_only', False):
+            # Use assistant_mask to only compute loss on assistant tokens
+            assistant_mask = labels != IGNORE_TOKEN_ID
+            if assistant_mask.sum() == 0:
+                # No assistant tokens in this batch, return zero loss
+                return torch.tensor(0.0, device=device, requires_grad=True), {"train_loss": 0.0}, [0.0]
         
         # Shift labels for next token prediction
         shifted_labels = labels[:, 1:].contiguous()  # [batch_size, seq_len-1]
@@ -114,16 +134,93 @@ class RecurrentDraftingTrainer(Trainer):
         
         # Compute top-k accuracy for logging
         with torch.no_grad():
-            top_k_preds = torch.topk(flat_logits, top_k, dim=-1)[1] # [batch_size*(seq_len-1), topk]
-            correct = (top_k_preds == flat_labels.unsqueeze(-1)).any(dim=-1) # [batch_size*(seq_len-1)]
-            accuracy = correct.float().mean().item()
+            # Only compute accuracy on non-ignored tokens
+            valid_mask = flat_labels != IGNORE_TOKEN_ID
+            if valid_mask.sum() > 0:
+                valid_logits = flat_logits[valid_mask]
+                valid_labels = flat_labels[valid_mask]
+                top_k_preds = torch.topk(valid_logits, min(top_k, valid_logits.size(-1)), dim=-1)[1]
+                correct = (top_k_preds == valid_labels.unsqueeze(-1)).any(dim=-1)
+                accuracy = correct.float().mean().item()
+            else:
+                accuracy = 0.0
         
         log_dict = {
             "train_loss": loss.item(),
-            f"train_top{top_k}_accuracy": accuracy
+            f"train_top{top_k}_accuracy": accuracy,
+            "train_method": "ground_truth"
         }
         
         eval_log = [accuracy]  # For metrics computation
+        
+        return loss, log_dict, eval_log
+    
+    def knowledge_distillation_loss(self, student_logits, teacher_logits, labels, next_n, top_k, temperature=4.0, alpha=0.7):
+        """
+        Compute knowledge distillation loss matching target distribution from base model.
+        
+        This implements the approach suggested in section 4.3.3 of the paper.
+        
+        Args:
+            student_logits: Speculator predictions [batch_size, seq_len, vocab_size]
+            teacher_logits: Base model predictions [batch_size, seq_len, vocab_size]
+            labels: Target token IDs [batch_size, seq_len]
+            next_n: Number of tokens to predict ahead
+            top_k: Top-k accuracy to compute
+            temperature: Temperature for softmax (higher = softer distributions)
+            alpha: Weight for distillation loss vs hard target loss
+        """
+        batch_size, seq_len, vocab_size = student_logits.shape
+        device = student_logits.device
+        
+        # Align dimensions - student predicts next tokens, teacher has current tokens
+        student_flat = student_logits[:, :-1].contiguous().view(-1, vocab_size)  # [batch*(seq-1), vocab]
+        teacher_flat = teacher_logits[:, :-next_n-1:-1].contiguous().view(-1, vocab_size)  # [batch*(seq-1), vocab]
+        
+        # Shift labels for next token prediction
+        shifted_labels = labels[:, 1:].contiguous().view(-1)  # [batch*(seq-1)]
+        
+        # Filter to only compute loss on assistant responses if specified
+        if getattr(self.args, 'train_on_assistant_only', False):
+            valid_mask = shifted_labels != IGNORE_TOKEN_ID
+            if valid_mask.sum() == 0:
+                return torch.tensor(0.0, device=device, requires_grad=True), {"train_loss": 0.0}, [0.0]
+            
+            student_flat = student_flat[valid_mask]
+            teacher_flat = teacher_flat[valid_mask]
+            shifted_labels = shifted_labels[valid_mask]
+        
+        # Compute soft targets from teacher
+        teacher_soft = torch.softmax(teacher_flat / temperature, dim=-1)
+        student_soft = torch.log_softmax(student_flat / temperature, dim=-1)
+        
+        # Distillation loss (KL divergence)
+        distill_loss = nn.KLDivLoss(reduction='batchmean')(student_soft, teacher_soft) * (temperature ** 2)
+        
+        # Hard target loss (standard cross-entropy)
+        hard_loss = self.loss_fct(student_flat, shifted_labels)
+        
+        # Combined loss
+        loss = alpha * distill_loss + (1 - alpha) * hard_loss
+        
+        # Compute top-k accuracy for logging
+        with torch.no_grad():
+            if len(student_flat) > 0:
+                top_k_preds = torch.topk(student_flat, min(top_k, student_flat.size(-1)), dim=-1)[1]
+                correct = (top_k_preds == shifted_labels.unsqueeze(-1)).any(dim=-1)
+                accuracy = correct.float().mean().item()
+            else:
+                accuracy = 0.0
+        
+        log_dict = {
+            "train_loss": loss.item(),
+            "train_distill_loss": distill_loss.item(),
+            "train_hard_loss": hard_loss.item(),
+            f"train_top{top_k}_accuracy": accuracy,
+            "train_method": "knowledge_distillation"
+        }
+        
+        eval_log = [accuracy]
         
         return loss, log_dict, eval_log
 
@@ -137,7 +234,7 @@ class ModelArguments:
 
 @dataclass 
 class TrainingArguments(transformers.TrainingArguments):
-    """Training arguments adapted from Apple's implementation."""
+    """Training arguments adapted from Apple's implementation with additional options."""
     cache_dir: Optional[str] = field(default=None)
     optim: str = field(default="adamw_torch")
     model_max_length: int = field(
@@ -173,6 +270,28 @@ class TrainingArguments(transformers.TrainingArguments):
     exit_dim_multiplier: float = field(
         default=1.0,
         metadata={"help": "Multiplier for exit dimension (exit_dim = multiplier * hidden_size)"},
+    )
+    # Knowledge distillation options
+    use_knowledge_distillation: bool = field(
+        default=False,
+        metadata={"help": "Use knowledge distillation instead of ground-truth training"},
+    )
+    kd_temperature: float = field(
+        default=4.0,
+        metadata={"help": "Temperature for knowledge distillation softmax"},
+    )
+    kd_alpha: float = field(
+        default=0.7,
+        metadata={"help": "Weight for distillation loss (vs hard target loss)"},
+    )
+    # Training data filtering
+    train_on_assistant_only: bool = field(
+        default=False,
+        metadata={"help": "Only compute loss on assistant responses (not user prompts)"},
+    )
+    dataset_name: str = field(
+        default="sharegpt",
+        metadata={"help": "Dataset to use: 'sharegpt', 'alpaca', 'mtbench', 'wikitext'"},
     )
     # Wandb integration via HF Trainer's built-in support
     run_name: Optional[str] = field(
@@ -284,7 +403,7 @@ class DataCollatorForLanguageModeling:
         # Pad sequences to the same length
         input_ids = torch.nn.utils.rnn.pad_sequence(
             input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id
-        )
+        ) # [len(examples), max_seq_len] (right padded)
         attention_masks = torch.nn.utils.rnn.pad_sequence(
             attention_masks, batch_first=True, padding_value=0
         )
@@ -326,21 +445,28 @@ def convert_alpaca_to_sharegpt(example):
     return {"conversations": conversations}
 
 
-def sharegpt_record_to_training_instance(example, tokenizer):
+def sharegpt_record_to_training_instance(example, tokenizer, train_on_assistant_only=False):
     """
     Convert ShareGPT record to training instance.
     
-    This matches the data processing from Apple's original implementation.
+    Args:
+        example: ShareGPT conversation example
+        tokenizer: Tokenizer to use
+        train_on_assistant_only: If True, only compute loss on assistant responses
     """
     conversations = example["conversations"]
     
-    # Build conversation text
-    text_parts = []
+    # Build conversation text and track assistant positions
+    text_parts: list[str] = []
+    assistant_markers = []  # Track which parts are assistant responses
+    
     for conv in conversations:
         if conv["from"] == "human":
             text_parts.append(f"Human: {conv['value']}")
+            assistant_markers.append(False)
         elif conv["from"] == "gpt":
             text_parts.append(f"Assistant: {conv['value']}")
+            assistant_markers.append(True)
     
     full_text = "\n\n".join(text_parts)
     
@@ -348,41 +474,128 @@ def sharegpt_record_to_training_instance(example, tokenizer):
     tokenized = tokenizer(
         full_text,
         truncation=True,
-        padding=False,  # Don't pad individual examples
+        padding=False,
         max_length=tokenizer.model_max_length,
         return_tensors="pt"
     )
     
-    # Labels are the same as input_ids for language modeling
+    input_ids = tokenized["input_ids"].squeeze(0)
+    attention_mask = tokenized["attention_mask"].squeeze(0)
+    
+    # Create labels - mask human parts if train_on_assistant_only
+    if train_on_assistant_only:
+        labels = input_ids.clone()
+        
+        # Find assistant response boundaries in tokenized text
+        # This is approximate - for production, you'd want more precise tracking
+        human_prefix = tokenizer.encode("Human:", add_special_tokens=False)
+        assistant_prefix = tokenizer.encode("Assistant:", add_special_tokens=False)
+        
+        # Mask human responses (set to IGNORE_TOKEN_ID)
+        current_pos = 0
+        for i, text_part in enumerate(text_parts):
+            part_tokens = tokenizer.encode(text_part, add_special_tokens=False)
+            part_len = len(part_tokens)
+            
+            if not assistant_markers[i]:  # Human response
+                # Mask this part
+                end_pos = min(current_pos + part_len, len(labels))
+                labels[current_pos:end_pos] = IGNORE_TOKEN_ID
+            
+            current_pos += part_len + 2  # +2 for "\n\n" separator tokens (approximate)
+            if current_pos >= len(labels):
+                break
+    else:
+        labels = input_ids.clone()
+    
     result = {
-        "input_ids": tokenized["input_ids"].squeeze(0),
-        "attention_mask": tokenized["attention_mask"].squeeze(0),
-        "labels": tokenized["input_ids"].squeeze(0).clone()
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "labels": labels
     }
     
     return result
 
 
-def prepare_dataset(tokenizer, training_args, split="train"):
-    """Prepare training dataset matching Apple's implementation."""
+def prepare_dataset(tokenizer, training_args, split="train") -> list[dict]:
+    """
+    Prepare training dataset with multiple dataset options.
+    
+    Addresses the uncertainty about which dataset was used in the original paper.
+    """
+    dataset_name = getattr(training_args, 'dataset_name', 'sharegpt')
+    train_on_assistant_only = getattr(training_args, 'train_on_assistant_only', False)
+    
+    print(f"🔄 Loading {dataset_name} dataset for {split}...")
     
     if split == "train":
-        # Use ShareGPT dataset for training (matches Apple's approach)
-        try:
-            print("🔄 Loading ShareGPT training dataset...")
-            dataset = datasets.load_dataset("Aeala/ShareGPT_Vicuna_unfiltered", split="train")
-            
-            # Process dataset
-            tokenized_dataset = dataset.map(
-                lambda x: sharegpt_record_to_training_instance(x, tokenizer),
-                num_proc=min(4, multiprocessing.cpu_count()),
-                remove_columns=dataset.column_names
-            )
-            
-        except Exception as e:
-            print(f"⚠️ Could not load ShareGPT dataset: {e}")
-            print("🔄 Falling back to WikiText dataset...")
-            
+        if dataset_name == "sharegpt":
+            try:
+                print("🔄 Loading ShareGPT training dataset...")
+                dataset = datasets.load_dataset("Aeala/ShareGPT_Vicuna_unfiltered", split="train")
+                
+                # Process dataset
+                tokenized_dataset = dataset.map(
+                    lambda x: sharegpt_record_to_training_instance(x, tokenizer, train_on_assistant_only),
+                    num_proc=min(4, multiprocessing.cpu_count()),
+                    remove_columns=dataset.column_names
+                )
+                
+            except Exception as e:
+                print(f"⚠️ Could not load ShareGPT dataset: {e}")
+                print("🔄 Falling back to WikiText dataset...")
+                dataset_name = "wikitext"
+        
+        if dataset_name == "alpaca":
+            try:
+                print("🔄 Loading Alpaca training dataset...")
+                dataset = datasets.load_dataset("tatsu-lab/alpaca", split="train")
+                
+                # Convert to ShareGPT format then tokenize
+                dataset = dataset.map(
+                    convert_alpaca_to_sharegpt,
+                    num_proc=min(4, multiprocessing.cpu_count())
+                )
+                
+                tokenized_dataset = dataset.map(
+                    lambda x: sharegpt_record_to_training_instance(x, tokenizer, train_on_assistant_only),
+                    num_proc=min(4, multiprocessing.cpu_count()),
+                    remove_columns=dataset.column_names
+                )
+                
+            except Exception as e:
+                print(f"⚠️ Could not load Alpaca dataset: {e}")
+                print("🔄 Falling back to WikiText dataset...")
+                dataset_name = "wikitext"
+        
+        if dataset_name == "mtbench":
+            try:
+                print("🔄 Loading MT-Bench training dataset...")
+                # Note: MT-Bench is typically evaluation-only, but we can use it for training
+                dataset = datasets.load_dataset("lmsys/mt_bench", split="train")
+                
+                def mtbench_to_sharegpt(example):
+                    return {
+                        "conversations": [
+                            {"from": "human", "value": example["turns"][0]},
+                            {"from": "gpt", "value": example["turns"][1] if len(example["turns"]) > 1 else "I understand."}
+                        ]
+                    }
+                
+                dataset = dataset.map(mtbench_to_sharegpt, num_proc=min(4, multiprocessing.cpu_count()))
+                
+                tokenized_dataset = dataset.map(
+                    lambda x: sharegpt_record_to_training_instance(x, tokenizer, train_on_assistant_only),
+                    num_proc=min(4, multiprocessing.cpu_count()),
+                    remove_columns=dataset.column_names
+                )
+                
+            except Exception as e:
+                print(f"⚠️ Could not load MT-Bench dataset: {e}")
+                print("🔄 Falling back to WikiText dataset...")
+                dataset_name = "wikitext"
+        
+        if dataset_name == "wikitext":
             # Fallback to WikiText
             dataset = datasets.load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
             
@@ -405,22 +618,81 @@ def prepare_dataset(tokenizer, training_args, split="train"):
             )
     
     else:
-        # For evaluation, use Alpaca dataset (matches Apple's approach)
-        print("🔄 Loading Alpaca evaluation dataset...")
-        dataset = datasets.load_dataset("tatsu-lab/alpaca_eval", split="eval")
+        # For evaluation, provide multiple options
+        if dataset_name in ["alpaca", "sharegpt"]:
+            try:
+                print("🔄 Loading Alpaca evaluation dataset...")
+                dataset = datasets.load_dataset("tatsu-lab/alpaca_eval", split="eval")
+                
+                # Convert to ShareGPT format then tokenize
+                dataset = dataset.map(
+                    convert_alpaca_to_sharegpt,
+                    num_proc=min(4, multiprocessing.cpu_count())
+                )
+                
+                tokenized_dataset = dataset.map(
+                    lambda x: sharegpt_record_to_training_instance(x, tokenizer, train_on_assistant_only),
+                    num_proc=min(4, multiprocessing.cpu_count()),
+                    remove_columns=dataset.column_names
+                )
+                
+            except Exception as e:
+                print(f"⚠️ Could not load Alpaca eval dataset: {e}")
+                # Fallback to validation split of training dataset
+                tokenized_dataset = prepare_dataset(tokenizer, training_args, split="train")
+                # Take a small subset for evaluation
+                tokenized_dataset = tokenized_dataset.select(range(min(1000, len(tokenized_dataset))))
         
-        # Convert to ShareGPT format then tokenize
-        dataset = dataset.map(
-            convert_alpaca_to_sharegpt,
-            num_proc=min(4, multiprocessing.cpu_count())
-        )
+        elif dataset_name == "mtbench":
+            try:
+                print("🔄 Loading MT-Bench evaluation dataset...")
+                dataset = datasets.load_dataset("lmsys/mt_bench", split="test")
+                
+                def mtbench_to_sharegpt(example):
+                    return {
+                        "conversations": [
+                            {"from": "human", "value": example["turns"][0]},
+                            {"from": "gpt", "value": example["turns"][1] if len(example["turns"]) > 1 else "I understand."}
+                        ]
+                    }
+                
+                dataset = dataset.map(mtbench_to_sharegpt, num_proc=min(4, multiprocessing.cpu_count()))
+                
+                tokenized_dataset = dataset.map(
+                    lambda x: sharegpt_record_to_training_instance(x, tokenizer, train_on_assistant_only),
+                    num_proc=min(4, multiprocessing.cpu_count()),
+                    remove_columns=dataset.column_names
+                )
+                
+            except Exception as e:
+                print(f"⚠️ Could not load MT-Bench eval dataset: {e}")
+                # Fallback
+                tokenized_dataset = prepare_dataset(tokenizer, training_args, split="train")
+                tokenized_dataset = tokenized_dataset.select(range(min(1000, len(tokenized_dataset))))
         
-        tokenized_dataset = dataset.map(
-            lambda x: sharegpt_record_to_training_instance(x, tokenizer),
-            num_proc=min(4, multiprocessing.cpu_count()),
-            remove_columns=dataset.column_names
-        )
+        else:
+            # WikiText validation
+            dataset = datasets.load_dataset("wikitext", "wikitext-2-raw-v1", split="validation")
+            
+            def tokenize_wikitext(examples):
+                tokenized = tokenizer(
+                    examples["text"],
+                    truncation=True,
+                    padding=False,
+                    max_length=training_args.model_max_length,
+                    return_tensors="pt"
+                )
+                tokenized["labels"] = tokenized["input_ids"].clone()
+                return tokenized
+            
+            tokenized_dataset = dataset.map(
+                tokenize_wikitext,
+                batched=True,
+                num_proc=min(4, multiprocessing.cpu_count()),
+                remove_columns=dataset.column_names
+            )
     
+    print(f"✅ Loaded {len(tokenized_dataset)} examples from {dataset_name}")
     return tokenized_dataset
         
 def train(model_args, training_args):
@@ -755,38 +1027,69 @@ def demonstrate_training_need():
 
 
 def show_training_examples():
-    """Show training command examples."""
+    """Show training command examples addressing the paper's methodology questions."""
     
-    print("\n🚀 Training Examples")
-    print("=" * 30)
+    print("\n🚀 Training Examples - Addressing Paper Questions")
+    print("=" * 55)
     
     print("\n1. Quick Training (Demo):")
     print("python train_speculator.py --quick")
     
-    print("\n2. Full Training:")
+    print("\n2. Ground-Truth Training (Current Implementation):")
     print("python train_speculator.py \\")
     print("  --llm_name_or_path gpt2 \\")
-    print("  --output_dir ./models/gpt2-recurrent-drafter \\")
+    print("  --dataset_name sharegpt \\")
     print("  --num_train_epochs 3 \\")
     print("  --per_device_train_batch_size 8 \\")
-    print("  --learning_rate 5e-4 \\")
-    print("  --drafter_predict_n_tokens 4 \\")
-    print("  --drafter_num_layers 2 \\")
-    print("  --rnn")
+    print("  --learning_rate 5e-4")
     
-    print("\n3. Training with Weights & Biases:")
-    print("WANDB_PROJECT=my-recurrent-drafting python train_speculator.py \\")
+    print("\n3. Knowledge Distillation (Paper Section 4.3.3):")
+    print("python train_speculator.py \\")
     print("  --llm_name_or_path gpt2 \\")
-    print("  --report_to wandb \\")
-    print("  --run_name gpt2-experiment-1 \\")
-    print("  --num_train_epochs 3")
+    print("  --use_knowledge_distillation \\")
+    print("  --kd_temperature 4.0 \\")
+    print("  --kd_alpha 0.7 \\")
+    print("  --dataset_name sharegpt")
     
-    print("\n4. Evaluation:")
+    print("\n4. Train on Assistant Responses Only:")
+    print("python train_speculator.py \\")
+    print("  --llm_name_or_path gpt2 \\")
+    print("  --train_on_assistant_only \\")
+    print("  --dataset_name sharegpt")
+    
+    print("\n5. Train on Alpaca (Evaluation Dataset):")
+    print("python train_speculator.py \\")
+    print("  --llm_name_or_path gpt2 \\")
+    print("  --dataset_name alpaca \\")
+    print("  --num_train_epochs 5  # More epochs for smaller dataset")
+    
+    print("\n6. Train on MT-Bench (Evaluation Dataset):")
+    print("python train_speculator.py \\")
+    print("  --llm_name_or_path gpt2 \\")
+    print("  --dataset_name mtbench \\")
+    print("  --num_train_epochs 10  # More epochs for smaller dataset")
+    
+    print("\n7. Combined: Knowledge Distillation + Assistant Only + Alpaca:")
+    print("python train_speculator.py \\")
+    print("  --llm_name_or_path gpt2 \\")
+    print("  --use_knowledge_distillation \\")
+    print("  --train_on_assistant_only \\")
+    print("  --dataset_name alpaca \\")
+    print("  --report_to wandb \\")
+    print("  --run_name paper-reproduction-attempt")
+    
+    print("\n8. Evaluation on Different Datasets:")
     print("python train_speculator.py \\")
     print("  --phase eval \\")
     print("  --llm_name_or_path gpt2 \\")
     print("  --drafter_name_or_path ./models/gpt2-recurrent-drafter \\")
-    print("  --report_to wandb  # Optional: log eval results")
+    print("  --dataset_name alpaca  # or mtbench")
+    
+    print("\n📊 Experiment Matrix to Address Paper Questions:")
+    print("   • Ground-truth vs Knowledge Distillation")
+    print("   • Full conversation vs Assistant-only training")  
+    print("   • ShareGPT vs Alpaca vs MT-Bench datasets")
+    print("   • Cross-evaluation: train on X, eval on Y")
 
 
 def main():
@@ -810,6 +1113,21 @@ def main():
     parser.add_argument("--rnn", action="store_true", default=True)
     parser.add_argument("--phase", type=str, default="train", choices=["train", "eval"])
     parser.add_argument("--model_max_length", type=int, default=512)
+    
+    # Knowledge distillation options
+    parser.add_argument("--use_knowledge_distillation", action="store_true", 
+                       help="Use knowledge distillation instead of ground-truth training")
+    parser.add_argument("--kd_temperature", type=float, default=4.0,
+                       help="Temperature for knowledge distillation")
+    parser.add_argument("--kd_alpha", type=float, default=0.7,
+                       help="Weight for distillation loss vs hard target loss")
+    
+    # Training data options
+    parser.add_argument("--train_on_assistant_only", action="store_true",
+                       help="Only compute loss on assistant responses")
+    parser.add_argument("--dataset_name", type=str, default="sharegpt",
+                       choices=["sharegpt", "alpaca", "mtbench", "wikitext"],
+                       help="Dataset to use for training")
     
     # Experiment tracking arguments (using HF Trainer's built-in integration)
     parser.add_argument("--report_to", type=str, nargs="+", default=[], 
@@ -865,6 +1183,14 @@ def main():
             drafter_num_layers=args.drafter_num_layers,
             rnn=args.rnn,
             phase=args.phase,
+            # Knowledge distillation options
+            use_knowledge_distillation=args.use_knowledge_distillation,
+            kd_temperature=args.kd_temperature,
+            kd_alpha=args.kd_alpha,
+            # Training data options
+            train_on_assistant_only=args.train_on_assistant_only,
+            dataset_name=args.dataset_name,
+            # Experiment tracking
             report_to=args.report_to,  # HF Trainer's built-in experiment tracking
             run_name=args.run_name,
         )

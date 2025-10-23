@@ -113,6 +113,46 @@ python train_speculator.py \
     --rnn
 ```
 
+### Paper Reproduction Training
+
+```bash
+# Knowledge distillation (Paper's preferred method - Section 4.3.3)
+python train_speculator.py \
+    --llm_name_or_path gpt2 \
+    --use_knowledge_distillation \
+    --kd_temperature 4.0 \
+    --kd_alpha 0.7 \
+    --dataset_name sharegpt
+
+# Assistant-only training (focus on response quality)
+python train_speculator.py \
+    --llm_name_or_path gpt2 \
+    --train_on_assistant_only \
+    --dataset_name sharegpt
+
+# Combined approach (likely closest to paper's method)
+python train_speculator.py \
+    --llm_name_or_path gpt2 \
+    --use_knowledge_distillation \
+    --train_on_assistant_only \
+    --kd_temperature 4.0 \
+    --kd_alpha 0.7 \
+    --dataset_name sharegpt
+```
+
+### Systematic Paper Reproduction
+
+```bash
+# Run comprehensive experiments to reproduce paper results
+python experiment_paper_reproduction.py
+
+# This will test:
+# - Ground-truth vs Knowledge Distillation training
+# - Full conversation vs Assistant-only training  
+# - Different datasets (ShareGPT, Alpaca, MT-Bench)
+# - Cross-evaluation methodology
+```
+
 ### Training with Experiment Tracking
 
 ```bash
@@ -153,14 +193,36 @@ WANDB_PROJECT="dialogpt-experiments" python train_speculator.py \
 
 ### Training Parameters
 
+#### Core Model Parameters
 | Parameter | Description | Default | Recommended |
 |-----------|-------------|---------|-------------|
+| `--llm_name_or_path` | Base model to train speculator for | `gpt2` | Any HF model |
 | `--drafter_predict_n_tokens` | Tokens to predict ahead | 4 | 4-6 |
 | `--drafter_num_layers` | Drafter depth | 2 | 2-4 |
-| `--beam_width` | Beam search width | 10 | 10-20 |
-| `--beam_length` | Beam sequence length | 4 | 4-6 |
 | `--rnn` | Enable RNN state updates | True | True |
+| `--exit_dim_multiplier` | Exit dimension multiplier | 1.0 | 0.5-2.0 |
+
+#### Training Method Parameters
+| Parameter | Description | Default | Notes |
+|-----------|-------------|---------|-------|
+| `--use_knowledge_distillation` | Use KD instead of ground-truth | False | Paper's preferred method |
+| `--kd_temperature` | Temperature for KD softmax | 4.0 | Higher = softer distributions |
+| `--kd_alpha` | Weight for distillation loss | 0.7 | Balance KD vs hard targets |
+| `--train_on_assistant_only` | Train only on assistant responses | False | Improves response quality |
+
+#### Dataset Parameters  
+| Parameter | Description | Default | Options |
+|-----------|-------------|---------|---------|
+| `--dataset_name` | Training dataset | `sharegpt` | `sharegpt`, `alpaca`, `mtbench`, `wikitext` |
+| `--model_max_length` | Maximum sequence length | 512 | 256-2048 |
+
+#### Standard Training Parameters
+| Parameter | Description | Default | Recommended |
+|-----------|-------------|---------|-------------|
+| `--num_train_epochs` | Training epochs | 3 | 2-5 |
+| `--per_device_train_batch_size` | Batch size per device | 4 | 4-16 |
 | `--learning_rate` | Training learning rate | 5e-4 | 3e-4 to 1e-3 |
+| `--phase` | Training or evaluation | `train` | `train`, `eval` |
 
 ### Experiment Tracking Parameters
 
@@ -391,6 +453,73 @@ training_args = TrainingArguments(
 )
 ```
 
+## 📄 Paper Reproduction
+
+This implementation addresses key questions about Apple's original paper methodology and provides tools for systematic reproduction.
+
+### Key Paper Questions Addressed
+
+1. **Ground-Truth vs Knowledge Distillation**: Paper claims KD is better (Section 4.3.3) but original code only uses ground-truth
+2. **Training Focus**: Should training focus on assistant responses only, or full conversations?
+3. **Dataset Choice**: What training dataset was actually used? ShareGPT, Alpaca, or MT-Bench?
+4. **Evaluation Methodology**: Did they train specifically on evaluation datasets?
+
+### Reproduction Features
+
+#### Knowledge Distillation Training
+```bash
+# Implement paper's preferred method (Section 4.3.3)
+python train_speculator.py \
+    --use_knowledge_distillation \
+    --kd_temperature 4.0 \
+    --kd_alpha 0.7
+```
+
+#### Assistant-Only Training  
+```bash
+# Train only on assistant responses (not user prompts)
+python train_speculator.py \
+    --train_on_assistant_only
+```
+
+#### Multiple Dataset Support
+```bash
+# Test different training datasets
+python train_speculator.py --dataset_name sharegpt   # Assumed in original
+python train_speculator.py --dataset_name alpaca     # Evaluation dataset
+python train_speculator.py --dataset_name mtbench    # Evaluation dataset
+```
+
+#### Systematic Experiments
+```bash
+# Run comprehensive reproduction experiments
+python experiment_paper_reproduction.py
+
+# This tests all combinations:
+# - Ground-truth vs Knowledge Distillation
+# - Full conversation vs Assistant-only
+# - ShareGPT vs Alpaca vs MT-Bench datasets
+# - Cross-evaluation (train on X, eval on Y)
+```
+
+### Expected Findings
+
+Based on the paper's claims, you should observe:
+
+- **Knowledge Distillation** improves top-k accuracy vs ground-truth training
+- **Assistant-only training** improves response quality metrics  
+- **Training on evaluation datasets** may show inflated performance (potential overfitting)
+- **Cross-dataset evaluation** reveals true generalization capability
+
+### Analysis Tools
+
+The reproduction framework provides:
+
+- 📊 **Systematic experiment tracking** with Weights & Biases
+- 🔄 **Cross-evaluation methodology** (train on X, eval on Y)
+- 📈 **Performance comparison** across all method combinations
+- 📋 **Detailed analysis guide** (`./experiments/analysis_guide.md`)
+
 ## 🧪 Evaluation & Testing
 
 ### Model Evaluation
@@ -403,6 +532,15 @@ WANDB_PROJECT="model-evaluation" python train_speculator.py \
     --drafter_name_or_path ./models/gpt2-recurrent-drafter \
     --report_to wandb \
     --run_name "gpt2-eval-final"
+
+# Cross-dataset evaluation (train on X, eval on Y)
+python train_speculator.py \
+    --phase eval \
+    --llm_name_or_path gpt2 \
+    --drafter_name_or_path ./models/gpt2-recurrent-drafter \
+    --dataset_name alpaca \
+    --report_to wandb \
+    --run_name "sharegpt-model-alpaca-eval"
 ```
 
 ### Unit Tests
@@ -462,29 +600,70 @@ python huggingface_deployment.py \
 # 1. Quick demo training
 python train_speculator.py --quick
 
-# 2. Small model training
+# 2. Basic training (ground-truth method)
 python train_speculator.py \
     --llm_name_or_path gpt2 \
     --num_train_epochs 2 \
-    --per_device_train_batch_size 4
+    --per_device_train_batch_size 4 \
+    --dataset_name sharegpt
 
-# 3. Medium model with tracking
+# 3. Knowledge distillation training (paper's method)
+python train_speculator.py \
+    --llm_name_or_path gpt2 \
+    --use_knowledge_distillation \
+    --kd_temperature 4.0 \
+    --kd_alpha 0.7 \
+    --dataset_name sharegpt \
+    --num_train_epochs 3
+
+# 4. Assistant-only training
+python train_speculator.py \
+    --llm_name_or_path gpt2 \
+    --train_on_assistant_only \
+    --dataset_name sharegpt \
+    --num_train_epochs 3
+
+# 5. Combined approach (KD + Assistant-only)
+python train_speculator.py \
+    --llm_name_or_path gpt2 \
+    --use_knowledge_distillation \
+    --train_on_assistant_only \
+    --kd_temperature 4.0 \
+    --kd_alpha 0.7 \
+    --dataset_name sharegpt
+
+# 6. Train on evaluation dataset (Alpaca)
+python train_speculator.py \
+    --llm_name_or_path gpt2 \
+    --dataset_name alpaca \
+    --num_train_epochs 5 \
+    --use_knowledge_distillation \
+    --train_on_assistant_only
+
+# 7. Medium model with tracking
 WANDB_PROJECT="gpt2-medium-experiments" python train_speculator.py \
     --llm_name_or_path gpt2-medium \
+    --use_knowledge_distillation \
+    --train_on_assistant_only \
     --num_train_epochs 3 \
     --per_device_train_batch_size 2 \
     --gradient_accumulation_steps 4 \
     --report_to wandb \
-    --run_name "medium-model-v1"
+    --run_name "medium-model-kd-assistant"
 
-# 4. Large model training
+# 8. Large model training
 python train_speculator.py \
     --llm_name_or_path gpt2-large \
+    --use_knowledge_distillation \
+    --train_on_assistant_only \
     --num_train_epochs 3 \
     --per_device_train_batch_size 1 \
     --gradient_accumulation_steps 8 \
     --drafter_num_layers 3 \
     --model_max_length 1024
+
+# 9. Systematic paper reproduction
+python experiment_paper_reproduction.py
 ```
 
 </details>
@@ -580,6 +759,84 @@ See [NOTICE](NOTICE) file for complete attribution details.
 - ✅ **Enhanced training** with Weights & Biases support
 - ✅ **Better evaluation** with MT-Bench and custom datasets
 - ✅ **Standalone** - no dependencies on original Apple code
+
+## 📋 CLI Reference
+
+### Complete Training Arguments
+
+```bash
+python train_speculator.py \
+    # Model Configuration
+    --llm_name_or_path gpt2 \                    # Base model path/name
+    --drafter_name_or_path ./path/to/drafter \   # For evaluation only
+    --output_dir ./models/output \               # Where to save trained model
+    
+    # Training Method (choose one approach)
+    --use_knowledge_distillation \               # Use KD instead of ground-truth
+    --kd_temperature 4.0 \                       # KD temperature (higher = softer)
+    --kd_alpha 0.7 \                            # KD loss weight (0.0-1.0)
+    
+    # Training Data
+    --dataset_name sharegpt \                    # sharegpt|alpaca|mtbench|wikitext
+    --train_on_assistant_only \                 # Only train on assistant responses
+    --model_max_length 512 \                    # Max sequence length
+    
+    # Model Architecture  
+    --drafter_predict_n_tokens 4 \              # Tokens to predict ahead
+    --drafter_num_layers 2 \                    # Drafter depth
+    --rnn \                                     # Enable RNN (recommended)
+    --exit_dim_multiplier 1.0 \                 # Exit dimension scaling
+    
+    # Training Parameters
+    --num_train_epochs 3 \                      # Training epochs
+    --per_device_train_batch_size 8 \           # Batch size per GPU
+    --learning_rate 5e-4 \                      # Learning rate
+    --phase train \                             # train|eval
+    
+    # Experiment Tracking
+    --report_to wandb \                         # wandb|tensorboard|none
+    --run_name "my-experiment" \                # Experiment name
+    
+    # Quick Options
+    --quick \                                   # Quick demo training
+    --demo                                      # Show info only (no training)
+```
+
+### Environment Variables
+
+```bash
+# Weights & Biases Configuration
+export WANDB_PROJECT="my-recurrent-drafting"   # Project name
+export WANDB_ENTITY="my-team"                  # Team/user name  
+export WANDB_TAGS="gpt2,production"            # Comma-separated tags
+export WANDB_NOTES="Experiment description"    # Run description
+
+# Training Configuration
+export CUDA_VISIBLE_DEVICES="0,1"              # GPU selection
+export TOKENIZERS_PARALLELISM=false            # Avoid tokenizer warnings
+```
+
+### Common Command Patterns
+
+```bash
+# Quick start
+python train_speculator.py --quick
+
+# Paper reproduction (recommended)
+python train_speculator.py \
+    --use_knowledge_distillation \
+    --train_on_assistant_only \
+    --dataset_name sharegpt
+
+# Evaluation
+python train_speculator.py \
+    --phase eval \
+    --llm_name_or_path gpt2 \
+    --drafter_name_or_path ./models/my-drafter
+
+# Systematic experiments
+python experiment_paper_reproduction.py
+```
 
 ## 🔗 Links
 
