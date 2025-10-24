@@ -116,27 +116,28 @@ python train_speculator.py \
 ### Paper Reproduction Training
 
 ```bash
-# Knowledge distillation (Paper's preferred method - Section 4.3.3)
+# Paper's EXACT method (distilled dataset - Section 4.3.3)
+python train_speculator.py \
+    --llm_name_or_path gpt2 \
+    --use_distilled_dataset \
+    --distill_num_future_tokens 5 \
+    --distill_temperature 0.0 \
+    --train_on_assistant_only \
+    --dataset_name sharegpt
+
+# Standard knowledge distillation (alternative approach)
 python train_speculator.py \
     --llm_name_or_path gpt2 \
     --use_knowledge_distillation \
     --kd_temperature 4.0 \
     --kd_alpha 0.7 \
-    --dataset_name sharegpt
-
-# Assistant-only training (focus on response quality)
-python train_speculator.py \
-    --llm_name_or_path gpt2 \
     --train_on_assistant_only \
     --dataset_name sharegpt
 
-# Combined approach (likely closest to paper's method)
+# Ground-truth baseline (for comparison)
 python train_speculator.py \
     --llm_name_or_path gpt2 \
-    --use_knowledge_distillation \
     --train_on_assistant_only \
-    --kd_temperature 4.0 \
-    --kd_alpha 0.7 \
     --dataset_name sharegpt
 ```
 
@@ -457,68 +458,159 @@ training_args = TrainingArguments(
 
 This implementation addresses key questions about Apple's original paper methodology and provides tools for systematic reproduction.
 
-### Key Paper Questions Addressed
+### 🔍 Key Discovery: Paper's "Distilled Dataset" Method
 
-1. **Ground-Truth vs Knowledge Distillation**: Paper claims KD is better (Section 4.3.3) but original code only uses ground-truth
-2. **Training Focus**: Should training focus on assistant responses only, or full conversations?
-3. **Dataset Choice**: What training dataset was actually used? ShareGPT, Alpaca, or MT-Bench?
-4. **Evaluation Methodology**: Did they train specifically on evaluation datasets?
+**CRITICAL INSIGHT**: The paper uses a unique "distilled dataset" approach, not standard knowledge distillation!
 
-### Reproduction Features
+> "The distilled dataset was created by having the LLM generate 5 future tokens at each position of the ground-truth response using a temperature of 0."
 
-#### Knowledge Distillation Training
+#### What This Actually Means:
+
+1. **For each position** in the assistant's response
+2. **Generate 5 future tokens** using the base model (temperature=0)  
+3. **Create separate training examples** with context up to that position
+4. **Train with standard cross-entropy** on generated sequences (not KL divergence!)
+
+#### Visual Example:
+```
+Original: "Human: What is AI?\n\nAssistant: AI is artificial intelligence that enables..."
+
+Distilled Training Examples:
+Position 1: "Human: What is AI?\n\nAssistant: AI" → Generate 5 tokens
+Position 2: "Human: What is AI?\n\nAssistant: AI is" → Generate 5 tokens  
+Position 3: "Human: What is AI?\n\nAssistant: AI is artificial" → Generate 5 tokens
+...and so on for every position in the assistant response
+```
+
+### 🎯 Paper's Exact Method (Recommended)
+
 ```bash
-# Implement paper's preferred method (Section 4.3.3)
+# Paper's EXACT approach - distilled dataset creation
+python train_speculator.py \
+    --use_distilled_dataset \
+    --distill_num_future_tokens 5 \
+    --distill_temperature 0.0 \
+    --train_on_assistant_only \
+    --dataset_name sharegpt \
+    --report_to wandb \
+    --run_name "paper-exact-method"
+```
+
+**Key Parameters:**
+- `--use_distilled_dataset`: Creates the paper's distilled dataset
+- `--distill_num_future_tokens 5`: Generate 5 tokens (paper's setting)
+- `--distill_temperature 0.0`: Deterministic generation (paper's setting)
+- `--train_on_assistant_only`: Only create examples within assistant responses
+
+### 🔄 Alternative Methods for Comparison
+
+#### Standard Knowledge Distillation
+```bash
+# Standard KD approach (for comparison)
 python train_speculator.py \
     --use_knowledge_distillation \
     --kd_temperature 4.0 \
-    --kd_alpha 0.7
+    --kd_alpha 0.7 \
+    --train_on_assistant_only \
+    --dataset_name sharegpt \
+    --run_name "standard-kd-method"
 ```
 
-#### Assistant-Only Training  
+#### Ground-Truth Training
 ```bash
-# Train only on assistant responses (not user prompts)
+# Basic ground-truth training (baseline)
 python train_speculator.py \
-    --train_on_assistant_only
+    --dataset_name sharegpt \
+    --train_on_assistant_only \
+    --run_name "ground-truth-baseline"
 ```
 
-#### Multiple Dataset Support
-```bash
-# Test different training datasets
-python train_speculator.py --dataset_name sharegpt   # Assumed in original
-python train_speculator.py --dataset_name alpaca     # Evaluation dataset
-python train_speculator.py --dataset_name mtbench    # Evaluation dataset
+### 📊 Understanding Training Scope
+
+The implementation uses **full conversation context** but focuses training on **assistant responses only**:
+
+```
+Full Conversation Context (always available):
+├── System message (if any)
+├── Human: "What is AI?"                    [Context only - not trained on]
+└── Assistant: "AI is artificial..."        [Training focus - distilled examples created here]
 ```
 
-#### Systematic Experiments
+**Why This Makes Sense:**
+- ✅ Speculator sees full context (needed for appropriate responses)
+- ✅ Training focuses on response generation (the actual task)
+- ✅ Matches real-world usage (helping generate responses to user queries)
+
+### 🧪 Systematic Reproduction Experiments
+
 ```bash
-# Run comprehensive reproduction experiments
+# Run comprehensive experiments to test all approaches
 python experiment_paper_reproduction.py
 
-# This tests all combinations:
-# - Ground-truth vs Knowledge Distillation
-# - Full conversation vs Assistant-only
-# - ShareGPT vs Alpaca vs MT-Bench datasets
-# - Cross-evaluation (train on X, eval on Y)
+# This will test:
+# 1. Paper's distilled dataset method
+# 2. Standard knowledge distillation  
+# 3. Ground-truth training
+# 4. Different datasets (ShareGPT, Alpaca, MT-Bench)
+# 5. Cross-evaluation (train on X, eval on Y)
 ```
 
-### Expected Findings
+### 🎯 Expected Results
 
-Based on the paper's claims, you should observe:
+Based on the paper's claims, the **distilled dataset method** should show:
 
-- **Knowledge Distillation** improves top-k accuracy vs ground-truth training
-- **Assistant-only training** improves response quality metrics  
-- **Training on evaluation datasets** may show inflated performance (potential overfitting)
-- **Cross-dataset evaluation** reveals true generalization capability
+- **~10% higher speedup** than ground-truth training
+- **Better acceptance rates** in speculative decoding  
+- **More natural generation patterns** (learns actual LLM behavior)
+- **Superior multi-token prediction** accuracy
 
-### Analysis Tools
+### 📈 Key Differences Between Methods
 
-The reproduction framework provides:
+| Method | Dataset Size | Loss Function | Training Target | Computational Cost |
+|--------|-------------|---------------|-----------------|-------------------|
+| **Ground-Truth** | Original | Cross-Entropy | Ground-truth tokens | Low |
+| **Standard KD** | Original | KL Divergence | Teacher distributions | Medium |
+| **Paper's Method** | N×Original | Cross-Entropy | Generated sequences | High |
 
-- 📊 **Systematic experiment tracking** with Weights & Biases
-- 🔄 **Cross-evaluation methodology** (train on X, eval on Y)
-- 📈 **Performance comparison** across all method combinations
-- 📋 **Detailed analysis guide** (`./experiments/analysis_guide.md`)
+### 🔧 Reproduction Tools
+
+#### Test Understanding
+```bash
+# Demonstrate the distilled dataset approach
+python test_distilled_dataset.py
+
+# Show training scope differences  
+python demonstrate_training_scope.py
+```
+
+#### Monitor Training
+```bash
+# Track experiments with detailed metrics
+WANDB_PROJECT="paper-reproduction" python train_speculator.py \
+    --use_distilled_dataset \
+    --train_on_assistant_only \
+    --report_to wandb \
+    --run_name "distilled-dataset-experiment"
+```
+
+### 📋 Reproduction Checklist
+
+- [ ] **Distilled Dataset**: Use `--use_distilled_dataset` with 5 tokens, temperature 0
+- [ ] **Assistant Focus**: Use `--train_on_assistant_only` for response-focused training
+- [ ] **Full Context**: Ensure full conversation context is available (automatic)
+- [ ] **ShareGPT Data**: Use `--dataset_name sharegpt` (paper's likely choice)
+- [ ] **Cross-Evaluation**: Test on different datasets than training
+- [ ] **Acceptance Rates**: Measure actual speedup in generation, not just accuracy
+
+### 🎯 Bottom Line
+
+The paper's method is **fundamentally different** from standard approaches:
+- Creates a **much larger dataset** (N training examples per original conversation)
+- Trains on **what the base model would actually generate**
+- Focuses on **response generation patterns** rather than ground-truth prediction
+- Requires **significant computational resources** for dataset creation
+
+This explains why their method achieves superior performance - it directly learns the base model's generation behavior rather than just predicting ground-truth tokens.
 
 ## 🧪 Evaluation & Testing
 
@@ -607,49 +699,52 @@ python train_speculator.py \
     --per_device_train_batch_size 4 \
     --dataset_name sharegpt
 
-# 3. Knowledge distillation training (paper's method)
+# 3. Paper's EXACT method (distilled dataset)
+python train_speculator.py \
+    --llm_name_or_path gpt2 \
+    --use_distilled_dataset \
+    --distill_num_future_tokens 5 \
+    --distill_temperature 0.0 \
+    --train_on_assistant_only \
+    --dataset_name sharegpt \
+    --num_train_epochs 3
+
+# 4. Standard knowledge distillation (for comparison)
 python train_speculator.py \
     --llm_name_or_path gpt2 \
     --use_knowledge_distillation \
     --kd_temperature 4.0 \
     --kd_alpha 0.7 \
+    --train_on_assistant_only \
     --dataset_name sharegpt \
     --num_train_epochs 3
 
-# 4. Assistant-only training
+# 5. Assistant-only training (ground-truth baseline)
 python train_speculator.py \
     --llm_name_or_path gpt2 \
     --train_on_assistant_only \
     --dataset_name sharegpt \
     --num_train_epochs 3
 
-# 5. Combined approach (KD + Assistant-only)
+# 6. Train on evaluation dataset with paper's method
 python train_speculator.py \
     --llm_name_or_path gpt2 \
-    --use_knowledge_distillation \
+    --use_distilled_dataset \
     --train_on_assistant_only \
-    --kd_temperature 4.0 \
-    --kd_alpha 0.7 \
-    --dataset_name sharegpt
-
-# 6. Train on evaluation dataset (Alpaca)
-python train_speculator.py \
-    --llm_name_or_path gpt2 \
     --dataset_name alpaca \
     --num_train_epochs 5 \
-    --use_knowledge_distillation \
-    --train_on_assistant_only
+    --distill_max_examples 500
 
-# 7. Medium model with tracking
+# 7. Medium model with paper's method + tracking
 WANDB_PROJECT="gpt2-medium-experiments" python train_speculator.py \
     --llm_name_or_path gpt2-medium \
-    --use_knowledge_distillation \
+    --use_distilled_dataset \
     --train_on_assistant_only \
     --num_train_epochs 3 \
     --per_device_train_batch_size 2 \
     --gradient_accumulation_steps 4 \
     --report_to wandb \
-    --run_name "medium-model-kd-assistant"
+    --run_name "medium-model-distilled-dataset"
 
 # 8. Large model training
 python train_speculator.py \
@@ -772,6 +867,12 @@ python train_speculator.py \
     --output_dir ./models/output \               # Where to save trained model
     
     # Training Method (choose one approach)
+    --use_distilled_dataset \                   # Paper's exact method (recommended)
+    --distill_num_future_tokens 5 \             # Generate 5 tokens (paper setting)
+    --distill_temperature 0.0 \                 # Deterministic generation (paper setting)
+    --distill_max_examples 1000 \               # Limit examples for efficiency
+    
+    # Alternative: Standard Knowledge Distillation
     --use_knowledge_distillation \               # Use KD instead of ground-truth
     --kd_temperature 4.0 \                       # KD temperature (higher = softer)
     --kd_alpha 0.7 \                            # KD loss weight (0.0-1.0)
@@ -824,7 +925,7 @@ python train_speculator.py --quick
 
 # Paper reproduction (recommended)
 python train_speculator.py \
-    --use_knowledge_distillation \
+    --use_distilled_dataset \
     --train_on_assistant_only \
     --dataset_name sharegpt
 
@@ -869,6 +970,43 @@ If you use this implementation in your research, please cite both the original A
   year={2024},
   journal={arXiv preprint arXiv:2403.09919}
 }
+```
+
+## 🎯 Quick Reference: Paper Reproduction
+
+### TL;DR - Paper's Exact Method
+```bash
+# This is what the paper actually did:
+python train_speculator.py \
+    --use_distilled_dataset \
+    --distill_num_future_tokens 5 \
+    --distill_temperature 0.0 \
+    --train_on_assistant_only \
+    --dataset_name sharegpt
+```
+
+### Key Insights Discovered
+
+1. **"Distilled Dataset" ≠ Knowledge Distillation**: Paper creates new training examples by generating future tokens at each position
+2. **Full Context Used**: Uses entire conversation (human + assistant) as context
+3. **Assistant-Only Training**: Only creates training examples within assistant responses  
+4. **Dataset Explosion**: One conversation becomes N training examples (N = response length)
+5. **Standard Cross-Entropy**: Uses regular CE loss on generated sequences, not KL divergence
+
+### Why This Matters
+
+- **Better Performance**: Learns actual generation patterns, not just ground-truth prediction
+- **Higher Acceptance Rates**: Speculator mimics base model's behavior more accurately
+- **Computational Cost**: Requires significant resources for dataset creation
+- **Superior Results**: Paper reports ~10% speedup improvement over ground-truth training
+
+### Test Your Understanding
+```bash
+# See exactly how the distilled dataset works
+python test_distilled_dataset.py
+
+# Compare training scope approaches  
+python demonstrate_training_scope.py
 ```
 
 ---

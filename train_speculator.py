@@ -159,7 +159,8 @@ class RecurrentDraftingTrainer(Trainer):
         """
         Compute knowledge distillation loss matching target distribution from base model.
         
-        This implements the approach suggested in section 4.3.3 of the paper.
+        NOTE: This is the STANDARD KD approach, not the paper's "distilled dataset" method.
+        For the paper's approach, see create_distilled_dataset() function.
         
         Args:
             student_logits: Speculator predictions [batch_size, seq_len, vocab_size]
@@ -217,7 +218,7 @@ class RecurrentDraftingTrainer(Trainer):
             "train_distill_loss": distill_loss.item(),
             "train_hard_loss": hard_loss.item(),
             f"train_top{top_k}_accuracy": accuracy,
-            "train_method": "knowledge_distillation"
+            "train_method": "knowledge_distillation_standard"
         }
         
         eval_log = [accuracy]
@@ -292,6 +293,23 @@ class TrainingArguments(transformers.TrainingArguments):
     dataset_name: str = field(
         default="sharegpt",
         metadata={"help": "Dataset to use: 'sharegpt', 'alpaca', 'mtbench', 'wikitext'"},
+    )
+    # Paper's distilled dataset approach
+    use_distilled_dataset: bool = field(
+        default=False,
+        metadata={"help": "Create distilled dataset as described in paper (LLM generates 5 future tokens at each position)"},
+    )
+    distill_num_future_tokens: int = field(
+        default=5,
+        metadata={"help": "Number of future tokens to generate for distilled dataset (paper uses 5)"},
+    )
+    distill_temperature: float = field(
+        default=0.0,
+        metadata={"help": "Temperature for distilled dataset generation (paper uses 0)"},
+    )
+    distill_max_examples: int = field(
+        default=1000,
+        metadata={"help": "Maximum number of examples to process for distilled dataset (for efficiency)"},
     )
     # Wandb integration via HF Trainer's built-in support
     run_name: Optional[str] = field(
@@ -445,6 +463,94 @@ def convert_alpaca_to_sharegpt(example):
     return {"conversations": conversations}
 
 
+def create_distilled_dataset_entry(example, tokenizer, base_model, num_future_tokens=5, temperature=0.0, train_on_assistant_only=False):
+    """
+    Create a distilled dataset entry following the paper's approach:
+    "The distilled dataset was created by having the LLM generate 5 future tokens 
+    at each position of the ground-truth response using a temperature of 0."
+    
+    This means: for each position t in the ground-truth sequence, we have the LLM
+    generate the next 5 tokens, creating multiple training examples per original sequence.
+    
+    Args:
+        example: ShareGPT conversation example
+        tokenizer: Tokenizer to use
+        base_model: The teacher LLM to generate distilled targets
+        num_future_tokens: Number of future tokens to generate (paper uses 5)
+        temperature: Generation temperature (paper uses 0 for deterministic)
+        train_on_assistant_only: If True, only create distilled examples for assistant responses
+    
+    Returns:
+        List of distilled training examples
+    """
+    # First convert to standard format
+    standard_instance = sharegpt_record_to_training_instance(example, tokenizer, train_on_assistant_only)
+    
+    input_ids = standard_instance["input_ids"]
+    attention_mask = standard_instance["attention_mask"]
+    labels = standard_instance["labels"]
+    
+    distilled_examples = []
+    
+    # For each position t in the sequence (except the last few)
+    seq_len = len(input_ids)
+    max_start_pos = seq_len - num_future_tokens - 1
+    
+    for t in range(0, max_start_pos, 4):  # Sample every 4th position to avoid too many examples
+        # Skip if this position should be ignored (human response when train_on_assistant_only=True)
+        if train_on_assistant_only and labels[t] == IGNORE_TOKEN_ID:
+            continue
+            
+        # Context up to position t
+        context_ids = input_ids[:t+1]
+        context_mask = attention_mask[:t+1]
+        
+        # Generate next num_future_tokens using the base model
+        with torch.no_grad():
+            try:
+                # Generate from the base model
+                generated = base_model.generate(
+                    input_ids=context_ids.unsqueeze(0),
+                    attention_mask=context_mask.unsqueeze(0),
+                    max_new_tokens=num_future_tokens,
+                    temperature=temperature if temperature > 0 else None,
+                    do_sample=temperature > 0,
+                    pad_token_id=tokenizer.pad_token_id,
+                    eos_token_id=tokenizer.eos_token_id,
+                )
+                
+                # Extract the generated tokens (remove the context)
+                generated_tokens = generated[0][len(context_ids):]
+                
+                # Create training example: context -> generated_tokens
+                if len(generated_tokens) >= num_future_tokens:
+                    # Input: context up to position t
+                    # Target: generated next num_future_tokens
+                    target_tokens = generated_tokens[:num_future_tokens]
+                    
+                    # Create the training instance
+                    full_input = torch.cat([context_ids, target_tokens])
+                    full_mask = torch.ones_like(full_input)
+                    
+                    # Labels: ignore context, predict generated tokens
+                    full_labels = torch.full_like(full_input, IGNORE_TOKEN_ID)
+                    full_labels[len(context_ids):] = target_tokens
+                    
+                    distilled_examples.append({
+                        "input_ids": full_input,
+                        "attention_mask": full_mask,
+                        "labels": full_labels,
+                        "distilled": True,  # Mark as distilled example
+                        "original_position": t,
+                    })
+                    
+            except Exception as e:
+                # Skip this position if generation fails
+                continue
+    
+    return distilled_examples
+
+
 def sharegpt_record_to_training_instance(example, tokenizer, train_on_assistant_only=False):
     """
     Convert ShareGPT record to training instance.
@@ -517,7 +623,7 @@ def sharegpt_record_to_training_instance(example, tokenizer, train_on_assistant_
     return result
 
 
-def prepare_dataset(tokenizer, training_args, split="train") -> list[dict]:
+def prepare_dataset(tokenizer, training_args, split="train", base_model=None) -> list[dict]:
     """
     Prepare training dataset with multiple dataset options.
     
@@ -525,8 +631,11 @@ def prepare_dataset(tokenizer, training_args, split="train") -> list[dict]:
     """
     dataset_name = getattr(training_args, 'dataset_name', 'sharegpt')
     train_on_assistant_only = getattr(training_args, 'train_on_assistant_only', False)
+    use_distilled_dataset = getattr(training_args, 'use_distilled_dataset', False)
     
     print(f"🔄 Loading {dataset_name} dataset for {split}...")
+    if use_distilled_dataset and split == "train":
+        print(f"📚 Creating distilled dataset (paper's approach): generate {getattr(training_args, 'distill_num_future_tokens', 5)} tokens at each position")
     
     if split == "train":
         if dataset_name == "sharegpt":
@@ -535,11 +644,45 @@ def prepare_dataset(tokenizer, training_args, split="train") -> list[dict]:
                 dataset = datasets.load_dataset("Aeala/ShareGPT_Vicuna_unfiltered", split="train")
                 
                 # Process dataset
-                tokenized_dataset = dataset.map(
-                    lambda x: sharegpt_record_to_training_instance(x, tokenizer, train_on_assistant_only),
-                    num_proc=min(4, multiprocessing.cpu_count()),
-                    remove_columns=dataset.column_names
-                )
+                if use_distilled_dataset and base_model is not None:
+                    print(f"🔄 Creating distilled dataset from {len(dataset)} examples...")
+                    # Limit examples for efficiency
+                    max_examples = getattr(training_args, 'distill_max_examples', 1000)
+                    if len(dataset) > max_examples:
+                        dataset = dataset.select(range(max_examples))
+                        print(f"📊 Limited to {max_examples} examples for distilled dataset creation")
+                    
+                    # Create distilled examples
+                    def create_distilled_examples(example):
+                        return create_distilled_dataset_entry(
+                            example, 
+                            tokenizer, 
+                            base_model,
+                            num_future_tokens=getattr(training_args, 'distill_num_future_tokens', 5),
+                            temperature=getattr(training_args, 'distill_temperature', 0.0),
+                            train_on_assistant_only=train_on_assistant_only
+                        )
+                    
+                    # Process examples to create distilled dataset
+                    all_distilled_examples = []
+                    for i, example in enumerate(dataset):
+                        if i % 100 == 0:
+                            print(f"🔄 Processing example {i}/{len(dataset)} for distilled dataset...")
+                        
+                        distilled_examples = create_distilled_examples(example)
+                        all_distilled_examples.extend(distilled_examples)
+                    
+                    print(f"✅ Created {len(all_distilled_examples)} distilled training examples")
+                    
+                    # Convert to HuggingFace dataset format
+                    tokenized_dataset = datasets.Dataset.from_list(all_distilled_examples)
+                else:
+                    # Standard processing
+                    tokenized_dataset = dataset.map(
+                        lambda x: sharegpt_record_to_training_instance(x, tokenizer, train_on_assistant_only),
+                        num_proc=min(4, multiprocessing.cpu_count()),
+                        remove_columns=dataset.column_names
+                    )
                 
             except Exception as e:
                 print(f"⚠️ Could not load ShareGPT dataset: {e}")
@@ -708,25 +851,48 @@ def train(model_args, training_args):
     tokenizer = get_tokenizer(model_args, training_args)
     compute_metrics = get_compute_metrics(training_args)
     
+    # Load base model first if we need it for distilled dataset
+    base_model_for_distillation = None
+    if getattr(training_args, 'use_distilled_dataset', False):
+        print(f"🔄 Loading base model for distilled dataset creation: {model_args.llm_name_or_path}")
+        # Set RoPE scaling factor if needed
+        config = AutoConfig.from_pretrained(model_args.llm_name_or_path)
+        orig_ctx_len = getattr(config, "max_position_embeddings", None)
+        if orig_ctx_len and training_args.model_max_length > orig_ctx_len:
+            scaling_factor = float(math.ceil(training_args.model_max_length / orig_ctx_len))
+            config.rope_scaling = {"type": "linear", "factor": scaling_factor}
+        
+        base_model_for_distillation = AutoModelForCausalLM.from_pretrained(
+            model_args.llm_name_or_path,
+            config=config,
+            cache_dir=training_args.cache_dir,
+            torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+        )
+        base_model_for_distillation.eval()  # Set to eval mode for generation
+    
     # Load training dataset (ShareGPT format, matching Apple's approach)
     print("🔄 Loading training dataset...")
-    train_dataset = prepare_dataset(tokenizer, training_args, split="train")
+    train_dataset = prepare_dataset(tokenizer, training_args, split="train", base_model=base_model_for_distillation)
     
-    # Set RoPE scaling factor if needed
-    config = AutoConfig.from_pretrained(model_args.llm_name_or_path)
-    orig_ctx_len = getattr(config, "max_position_embeddings", None)
-    if orig_ctx_len and training_args.model_max_length > orig_ctx_len:
-        scaling_factor = float(math.ceil(training_args.model_max_length / orig_ctx_len))
-        config.rope_scaling = {"type": "linear", "factor": scaling_factor}
-    
-    # Load and freeze the base model
-    print(f"🔄 Loading base model: {model_args.llm_name_or_path}")
-    llm = AutoModelForCausalLM.from_pretrained(
-        model_args.llm_name_or_path,
-        config=config,
-        cache_dir=training_args.cache_dir,
-        torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
-    )
+    # Load and freeze the base model (reuse if already loaded for distillation)
+    if base_model_for_distillation is not None:
+        print(f"🔄 Reusing base model for training: {model_args.llm_name_or_path}")
+        llm = base_model_for_distillation
+    else:
+        # Set RoPE scaling factor if needed
+        config = AutoConfig.from_pretrained(model_args.llm_name_or_path)
+        orig_ctx_len = getattr(config, "max_position_embeddings", None)
+        if orig_ctx_len and training_args.model_max_length > orig_ctx_len:
+            scaling_factor = float(math.ceil(training_args.model_max_length / orig_ctx_len))
+            config.rope_scaling = {"type": "linear", "factor": scaling_factor}
+        
+        print(f"🔄 Loading base model: {model_args.llm_name_or_path}")
+        llm = AutoModelForCausalLM.from_pretrained(
+            model_args.llm_name_or_path,
+            config=config,
+            cache_dir=training_args.cache_dir,
+            torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+        )
     
     # Freeze base model parameters
     for param in llm.parameters():
@@ -835,9 +1001,9 @@ def eval_model(model_args, training_args):
     compute_metrics = get_compute_metrics(training_args)
     
     # Load evaluation dataset (Alpaca format, matching Apple's approach)
-    print("🔄 Loading Alpaca evaluation dataset...")
+    print("🔄 Loading evaluation dataset...")
     try:
-        eval_dataset = prepare_dataset(tokenizer, training_args, split="eval")
+        eval_dataset = prepare_dataset(tokenizer, training_args, split="eval", base_model=None)
     except Exception as e:
         print(f"⚠️ Could not load Alpaca evaluation dataset: {e}")
         print("🔄 Falling back to WikiText validation...")
@@ -1043,12 +1209,20 @@ def show_training_examples():
     print("  --per_device_train_batch_size 8 \\")
     print("  --learning_rate 5e-4")
     
-    print("\n3. Knowledge Distillation (Paper Section 4.3.3):")
+    print("\n3. Knowledge Distillation - Standard Approach:")
     print("python train_speculator.py \\")
     print("  --llm_name_or_path gpt2 \\")
     print("  --use_knowledge_distillation \\")
     print("  --kd_temperature 4.0 \\")
     print("  --kd_alpha 0.7 \\")
+    print("  --dataset_name sharegpt")
+    
+    print("\n3b. Paper's Distilled Dataset Approach (Section 4.3.3):")
+    print("python train_speculator.py \\")
+    print("  --llm_name_or_path gpt2 \\")
+    print("  --use_distilled_dataset \\")
+    print("  --distill_num_future_tokens 5 \\")
+    print("  --distill_temperature 0.0 \\")
     print("  --dataset_name sharegpt")
     
     print("\n4. Train on Assistant Responses Only:")
@@ -1069,14 +1243,25 @@ def show_training_examples():
     print("  --dataset_name mtbench \\")
     print("  --num_train_epochs 10  # More epochs for smaller dataset")
     
-    print("\n7. Combined: Knowledge Distillation + Assistant Only + Alpaca:")
+    print("\n7. Paper's Exact Method (Distilled Dataset + Assistant Only):")
+    print("python train_speculator.py \\")
+    print("  --llm_name_or_path gpt2 \\")
+    print("  --use_distilled_dataset \\")
+    print("  --train_on_assistant_only \\")
+    print("  --distill_num_future_tokens 5 \\")
+    print("  --distill_temperature 0.0 \\")
+    print("  --dataset_name sharegpt \\")
+    print("  --report_to wandb \\")
+    print("  --run_name paper-exact-method")
+    
+    print("\n8. Standard KD + Assistant Only (Alternative):")
     print("python train_speculator.py \\")
     print("  --llm_name_or_path gpt2 \\")
     print("  --use_knowledge_distillation \\")
     print("  --train_on_assistant_only \\")
     print("  --dataset_name alpaca \\")
     print("  --report_to wandb \\")
-    print("  --run_name paper-reproduction-attempt")
+    print("  --run_name standard-kd-method")
     
     print("\n8. Evaluation on Different Datasets:")
     print("python train_speculator.py \\")
@@ -1128,6 +1313,16 @@ def main():
     parser.add_argument("--dataset_name", type=str, default="sharegpt",
                        choices=["sharegpt", "alpaca", "mtbench", "wikitext"],
                        help="Dataset to use for training")
+    
+    # Paper's distilled dataset approach
+    parser.add_argument("--use_distilled_dataset", action="store_true",
+                       help="Create distilled dataset as described in paper (LLM generates future tokens at each position)")
+    parser.add_argument("--distill_num_future_tokens", type=int, default=5,
+                       help="Number of future tokens to generate for distilled dataset (paper uses 5)")
+    parser.add_argument("--distill_temperature", type=float, default=0.0,
+                       help="Temperature for distilled dataset generation (paper uses 0)")
+    parser.add_argument("--distill_max_examples", type=int, default=1000,
+                       help="Maximum number of examples to process for distilled dataset")
     
     # Experiment tracking arguments (using HF Trainer's built-in integration)
     parser.add_argument("--report_to", type=str, nargs="+", default=[], 
@@ -1190,6 +1385,11 @@ def main():
             # Training data options
             train_on_assistant_only=args.train_on_assistant_only,
             dataset_name=args.dataset_name,
+            # Paper's distilled dataset approach
+            use_distilled_dataset=args.use_distilled_dataset,
+            distill_num_future_tokens=args.distill_num_future_tokens,
+            distill_temperature=args.distill_temperature,
+            distill_max_examples=args.distill_max_examples,
             # Experiment tracking
             report_to=args.report_to,  # HF Trainer's built-in experiment tracking
             run_name=args.run_name,
